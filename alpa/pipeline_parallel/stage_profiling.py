@@ -1296,7 +1296,7 @@ def get_compute_cost(
     profile_result_file_name = (f"./profile_result/profile-results-{timestamp}.npy")
 
 
-    np.save(profile_result_file_name, profile_results)
+    # np.save(profile_result_file_name, profile_results)
     global last_compute_cost_file_name
     last_compute_cost_file_name = profile_result_file_name
     print(f"Profile result saved to: {profile_result_file_name}")

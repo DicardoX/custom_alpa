@@ -45,7 +45,7 @@ from alpa.util import (get_var_mapping, trace_jaxpr_with_micro_batch,
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-
+ 
 def compile_pipeshard_executable(
         fun: lu.WrappedFun, in_tree: PyTreeDef,
         out_tree_thunk: Callable[[], PyTreeDef], static_argnums: Sequence[int],

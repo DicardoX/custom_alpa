@@ -876,6 +876,12 @@ def trace_jaxpr_with_micro_batch(fun: lu.WrappedFun,
     monkey_patch_random()
     monkey_patch_jaxarray()
 
+    # print(batch_invars)
+    # print(len(batch_invars))
+    # print("")
+    # print(raw_avals)
+    # print(len(raw_avals))
+
     avals = []
     batch_size = None
     for aval, is_batch_var in zip(raw_avals, batch_invars):
@@ -893,6 +899,10 @@ def trace_jaxpr_with_micro_batch(fun: lu.WrappedFun,
             avals.append(aval.update(shape=shape))
         else:
             avals.append(aval)
+
+    # print("")
+    # print(avals)
+    
     with jax.disable_jit():
         jaxpr, _, consts = pe.trace_to_jaxpr_final(fun, avals)
     closed_jaxpr = ClosedJaxpr(jaxpr, consts)
@@ -900,6 +910,7 @@ def trace_jaxpr_with_micro_batch(fun: lu.WrappedFun,
     # Restore jax.random to original stateless version
     restore_random()
     restore_jaxarray()
+
     return closed_jaxpr, batch_size
 
 

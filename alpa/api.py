@@ -83,7 +83,19 @@ def parallelize(fun: Optional[Callable] = None,
     """
     check_alpa_jaxlib_version()
 
+    # print(fun)
+    # print("")
+    # print(static_argnums)
+    # print("")
+    # print(donate_argnums)
+    # print("")
+    # print(batch_argnums)
+
     def decorate_fun(fun):
+        
+        # print("111")
+        # print(fun)
+        
         api._check_callable(fun)  # pylint: disable=protected-access
         nonlocal method
         method = method or ShardParallel()
@@ -145,6 +157,10 @@ class ParallelizedFunc:
                                                          self.batch_argnums)
         kwargs = {}
 
+        # print("Func:")
+        # print(self.fun)
+        # print("")
+        
         f = lu.wrap_init(self.fun)
 
         # Deal with static arguments and extract dynamic arguments

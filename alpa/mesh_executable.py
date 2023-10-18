@@ -433,7 +433,6 @@ class NormalMeshWorkerExecutable(MeshWorkerExecutable):
                  stage_plan: StagePlan, donated_invars: Sequence[bool]):
         num_devices = np.prod(stage_plan.logical_mesh_shape)
         assert num_devices == len(worker.backend.devices())
-
         self.compiled = run_backend_compilation(worker.backend, hlo, stage_plan,
                                                 num_devices)
         self.donated_invars = donated_invars
