@@ -1292,7 +1292,7 @@ def get_compute_cost(
 
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
-    # NOTE: Modify the file path to the dir mounted with the container 
+    # NOTE: Modify the .npy file path to the dir mounted with the container 
     profile_result_file_name = (f"./profile_result/profile-results-{timestamp}.npy")
 
 
