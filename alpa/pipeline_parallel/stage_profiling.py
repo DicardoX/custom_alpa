@@ -7,7 +7,7 @@ from datetime import datetime
 import gc
 import logging
 import pickle
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Sequence, Tuple, Any
 
 import jax.numpy as jnp
 from jax.core import (ClosedJaxpr, Var, gensym)
@@ -1158,6 +1158,74 @@ def _get_layer_flops_prefix_sum(layers):
         layer_flops = sum(eqn_flops(eqn) for eqn in layer.eqns)
         layer_flops_prefix_sum.append(layer_flops_prefix_sum[-1] + layer_flops)
     return layer_flops_prefix_sum
+
+
+##################################
+#     Crius-Defined Function     #
+##################################
+
+def crius_forge_stage_prof_results(mesh_num_devices: int, cluster_size: int, mesh_id: int, 
+                                   num_all_layers: int, layer_flops_prefix_sum: Sequence[int],
+                                   autosharding_configs: Any,
+                                   profile_results: dict,
+                                   imba_tolerance: float = np.inf):
+    """ 
+    Forge fake profiling results for pruned stages after prohibiting allocating `mesh_num_devices` devices 
+    for one stage. This function is called in get_compute_cost() to retain consistency of profilling results 
+    after skip profiling of pruned stages.
+    ----------------------------------------------------------
+    Note:
+        - The workflow is basicly similar (but more lightweight) to generate_training_stages_2d(), skipping 
+          hlo generation.
+    """
+    assert num_all_layers % 2 == 0, \
+        f"The number of forward + backward layers should be dividable by 2, got {num_all_layers}."
+    num_layers = num_all_layers // 2
+    # Resource quota for this submesh
+    resource_ratio = mesh_num_devices / cluster_size
+    is_full_mesh = resource_ratio == 1
+    # Total flops
+    total_flops = layer_flops_prefix_sum[2 * num_layers]
+
+    # Get pruned stages
+    pruned_stages = list()
+    for _s_idx in range(num_layers):
+        for _e_idx in range(_s_idx, num_layers):
+            if is_full_mesh and not (_s_idx == 0 and _e_idx == num_layers - 1):
+                # Must merge all layers for full mesh
+                continue
+            # Flops ratio
+            forward_layers_flops = layer_flops_prefix_sum[_e_idx + 1] - \
+                                        layer_flops_prefix_sum[_s_idx]
+            backward_layers_flops = layer_flops_prefix_sum[2 * num_layers - _s_idx] - \
+                                        layer_flops_prefix_sum[2 * num_layers - _e_idx - 1]
+            flops_ratio = (forward_layers_flops + backward_layers_flops) / total_flops
+            if (resource_ratio > flops_ratio * (1 + imba_tolerance) or 
+                resource_ratio < flops_ratio / (1 + imba_tolerance)):
+                # Exceed stage imbalance tolerance towards computing flops
+                continue
+            # Construct fake stages
+            for _i, _cfg in enumerate(autosharding_configs):
+                if _cfg is not None:
+                    _stage_idx = (_s_idx, _e_idx, mesh_id, _i)
+                    pruned_stages.append((_stage_idx, None, _cfg))
+
+    # Forge profiling results
+    num_modules_per_stage = 2   # Forward + backward modules
+    for _i, (_stage_idx, _, _as_cfg) in enumerate(pruned_stages):
+        assert _stage_idx not in profile_results, \
+            f"Index of a pruned stage ({_stage_idx}) should not have been recorded in profiling results."
+        forged_stage_result = StageProfileResult(num_modules_per_stage, list(), list())
+        # Forge module profiling results in the stage
+        for _module_idx in forged_stage_result.n_modules:
+            # TODO(chunyu): Set the module cost and memory to disable the selection of this pruned
+            #               stage in dynamic programming.
+            raise NotImplementedError()
+
+        profile_results[_stage_idx] = forged_stage_result
+
+
+    return profile_results, pruned_stages
 
 
 def get_compute_cost(
