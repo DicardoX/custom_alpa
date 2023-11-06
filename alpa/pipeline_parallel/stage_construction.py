@@ -314,6 +314,11 @@ def training_dp(num_layers, num_devices, num_microbatches, submesh_choices,
     timers("stage-construction-dp").start()
 
     all_possible_stage_costs = np.sort(np.unique(compute_cost))
+    
+    print(all_possible_stage_costs)
+
+    exit(0)
+    
     best_cost = np.inf
     best_solution = None
     last_max_stage_cost = 0.0
@@ -568,6 +573,26 @@ def get_sliced_virtual_submeshes(virtual_mesh, submesh_shapes):
     return virtual_submeshes
 
 
+##################################
+#     Crius-Defined Function     #
+##################################
+
+def crius_coarsen_layers_near_uniform():
+    """ 
+    Further coarsen pipeline layers with the given upper/lower bound of stage num 
+    near-uniformly by considering the following cases:
+    
+    TODO(chunyu): rethink this.
+    
+    - Case 1: Layer num is divisible or indivisible by device num, and the optimal
+              device assignment for each 
+               Just normally cluster 
+              uniformly with flops ratio.
+    - Case 2: Layer num is indivisible by device num. 
+    """
+    raise NotImplementedError()
+
+
 def cluster_layers_and_slice_mesh(
         layers: Sequence[JaxPipelineComputation],
         virtual_mesh: VirtualPhysicalMesh, accumulator_mapping: Dict[Var, Var],
@@ -629,6 +654,16 @@ def cluster_layers_and_slice_mesh(
             stage_option.submesh_logical_shape_space, batch_size)
         num_autosharding_configs = len(autosharding_configs[0])
 
+        ################################
+        # Modified by crius
+        max_num_stages = 8
+        min_num_stages = 1
+
+        # 
+
+        ################################
+
+        
         # Use DP to find the optimal solution.
         compute_cost, max_n_succ_stages = get_compute_cost(
             virtual_mesh, submesh_choices, autosharding_configs, layers,

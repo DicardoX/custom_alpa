@@ -55,6 +55,15 @@ last_compute_cost_file_name = None
 INFINITY_N_STAGES = 2**20
 GB = 1024**3
 
+###################################################
+# Modified by crius
+# Infinite memory size (bytes)
+CRIUS_INF_MEMSIZE = 128 * 1024**3
+# Infinite compute cost
+CRIUS_INF_COMP_COST = 1e9
+###################################################
+
+
 ModuleCompileOutput = namedtuple(
     "ModuleCompileOutput",
     ["hlo", "input_sharding_protos", "output_sharding_proto"])
@@ -492,7 +501,7 @@ def compile_all(stages, num_micro_batches, default_as_option, profile_results):
     num_compiled_stages = 0
     for i, (stage_idx, stage_config, auto_sharding_config) in enumerate(stages):
         if (stage_idx in profile_results and
-                profile_results[stage_idx].fully_profiled()):
+                profile_results[stage_idx].fully_profiled()):    
             continue
         logical_mesh, autosharding_option_dict = auto_sharding_config
         compile_workers.submit(
@@ -914,10 +923,20 @@ def get_merged_stages_memory_stats(
             max_stage)
 
 
+###################################################
+# Modified by crius
+# (Original api)
+# def interpret_profile_result_training_2d(
+#         profile_results: Dict[Tuple[int, ...],
+#                               StageProfileResult], num_layers: int,
+#         num_submesh_choices: int, num_autosharding_configs: int):
+# (Modified api)
+###################################################
 def interpret_profile_result_training_2d(
         profile_results: Dict[Tuple[int, ...],
                               StageProfileResult], num_layers: int,
-        num_submesh_choices: int, num_autosharding_configs: int):
+        num_submesh_choices: int, num_autosharding_configs: int, 
+        pruned_stages_indices: Sequence[Tuple[int]]):
     all_compute_cost = np.full(
         (num_layers, num_layers, num_submesh_choices, num_autosharding_configs),
         np.inf,
@@ -931,6 +950,17 @@ def interpret_profile_result_training_2d(
                             num_autosharding_configs):
         if index not in profile_results:
             continue
+        
+        ###################################################
+        # Modified by crius
+        if index in pruned_stages_indices:
+            # Pruned stage
+            print(f"[TMP] Stage {index} has been pruned...")
+            all_compute_cost[index] = CRIUS_INF_COMP_COST
+            all_max_n_succ_stages[index] = -1
+            continue
+        ###################################################
+        
         profile_result = profile_results[index]
         all_compute_cost[index] = sum(
             result.compute_cost
@@ -1171,15 +1201,14 @@ def crius_forge_stage_prof_results(mesh_num_devices: int, cluster_size: int, mes
                                    imba_tolerance: float = np.inf):
     """ 
     Forge fake profiling results for pruned stages after prohibiting allocating `mesh_num_devices` devices 
-    for one stage. This function is called in get_compute_cost() to retain consistency of profilling results 
-    after skip profiling of pruned stages.
+    for one stage. This function is called in get_compute_cost() to compiling and profiling of pruned stages. 
     ----------------------------------------------------------
     Note:
         - The workflow is basicly similar (but more lightweight) to generate_training_stages_2d(), skipping 
           hlo generation.
     """
     assert num_all_layers % 2 == 0, \
-        f"The number of forward + backward layers should be dividable by 2, got {num_all_layers}."
+        f"The number of forward + backward layers should be divisible by 2, got {num_all_layers}."
     num_layers = num_all_layers // 2
     # Resource quota for this submesh
     resource_ratio = mesh_num_devices / cluster_size
@@ -1188,7 +1217,7 @@ def crius_forge_stage_prof_results(mesh_num_devices: int, cluster_size: int, mes
     total_flops = layer_flops_prefix_sum[2 * num_layers]
 
     # Get pruned stages
-    pruned_stages = list()
+    pruned_stages_indices = list()
     for _s_idx in range(num_layers):
         for _e_idx in range(_s_idx, num_layers):
             if is_full_mesh and not (_s_idx == 0 and _e_idx == num_layers - 1):
@@ -1208,24 +1237,35 @@ def crius_forge_stage_prof_results(mesh_num_devices: int, cluster_size: int, mes
             for _i, _cfg in enumerate(autosharding_configs):
                 if _cfg is not None:
                     _stage_idx = (_s_idx, _e_idx, mesh_id, _i)
-                    pruned_stages.append((_stage_idx, None, _cfg))
-
+                    pruned_stages_indices.append(_stage_idx)
+    
     # Forge profiling results
     num_modules_per_stage = 2   # Forward + backward modules
-    for _i, (_stage_idx, _, _as_cfg) in enumerate(pruned_stages):
+    for _i, _stage_idx in enumerate(pruned_stages_indices):
         assert _stage_idx not in profile_results, \
             f"Index of a pruned stage ({_stage_idx}) should not have been recorded in profiling results."
         forged_stage_result = StageProfileResult(num_modules_per_stage, list(), list())
-        # Forge module profiling results in the stage
-        for _module_idx in forged_stage_result.n_modules:
-            # TODO(chunyu): Set the module cost and memory to disable the selection of this pruned
-            #               stage in dynamic programming.
-            raise NotImplementedError()
-
+        # Forge infeasible module profiling results in the stage
+        for _module_idx in range(forged_stage_result.n_modules):
+            forged_stage_result.add_module_profile_result(
+                _module_idx,
+                ModuleProfileResult(
+                    compute_cost=CRIUS_INF_COMP_COST, 
+                    peak_memory=CRIUS_INF_MEMSIZE,
+                    temp_buffer_size=None,
+                    invar_names=None, outvar_names=None,
+                    invar_sizes=None, outvar_sizes=None,
+                    donated_invars=None, 
+                    acc_grad_invars_indices=None,
+                    acc_grad_outvars_indices=None,
+                    available_memory=None,
+                )
+            )
         profile_results[_stage_idx] = forged_stage_result
+        assert profile_results[_stage_idx].fully_profiled(), \
+            f"Not all modules in stage {_stage_idx} are profiled."
 
-
-    return profile_results, pruned_stages
+    return profile_results, pruned_stages_indices
 
 
 def get_compute_cost(
@@ -1300,6 +1340,13 @@ def get_compute_cost(
     print("-" * 20 + " Automatic stage clustering " + "-" * 20)
     print(f"submesh_choices: {submesh_choices}")
 
+    ################################
+    # Modified by crius
+    max_num_gpus_per_stage = 2
+    min_num_gpus_per_stage = 1
+    all_pruned_stages_indices = list()
+    ################################
+    
     # Reverse submesh_choices to test larger meshes first
     for mesh_id, submesh in reversed(list(enumerate(submesh_choices))):
         print(f"- Profiling for submesh {mesh_id} {submesh}:")
@@ -1314,6 +1361,31 @@ def get_compute_cost(
         else:
             sliced_virtual_meshes = virtual_mesh.slice_profiling_submeshes(
                 num_hosts, num_devices_per_host)
+            
+        
+        #####################################
+        # Modified by crius
+        if sliced_virtual_meshes[0].num_devices > max_num_gpus_per_stage or \
+            sliced_virtual_meshes[0].num_devices < min_num_gpus_per_stage:
+            # Forge profiling results of pruned stages, skipping compiling and profiling.
+            print("")
+            print(f"[TMP] Since submesh device num ({sliced_virtual_meshes[0].num_devices}) " + 
+                  f"> max gpu num per stage ({max_num_gpus_per_stage}) or < min gpu num per " + 
+                  f"stage ({min_num_gpus_per_stage}), skip compiling and profiling " + 
+                  f"on pruned stages and forge infeasible profiling results for them ...")
+            print("-" * 50)
+            print("")
+            profile_results, pruned_stages_indices = crius_forge_stage_prof_results(
+                mesh_num_devices=sliced_virtual_meshes[0].num_devices,
+                cluster_size=cluster_size, mesh_id=mesh_id, 
+                num_all_layers=len(layers), layer_flops_prefix_sum=layer_flops_prefix_sum,
+                autosharding_configs=autosharding_configs[mesh_id], 
+                profile_results=profile_results, 
+                imba_tolerance=auto_stage_option.stage_imbalance_tolerance)
+            all_pruned_stages_indices.extend(pruned_stages_indices)
+            continue
+        #####################################
+
 
         if auto_stage_option.layer_profile_mode == "composition":
             if inference_mode:
@@ -1352,7 +1424,7 @@ def get_compute_cost(
         profile_results = distributed_profile_on_mesh(
             stages, sliced_virtual_meshes, num_micro_batches, default_as_option,
             auto_stage_option, profile_results)
-
+        
         toc = time()
         print(f"Profiling for submesh {mesh_id} {submesh} takes {toc - tic:.2f}"
               f" seconds")
@@ -1360,15 +1432,16 @@ def get_compute_cost(
 
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 
-    # NOTE: Modify the .npy file path to the dir mounted with the container 
+    ###################################################
+    # (Modified by crius) Modify the .npy file path to the dir mounted with the container 
     profile_result_file_name = (f"./profile_result/profile-results-{timestamp}.npy")
-
 
     # np.save(profile_result_file_name, profile_results)
     global last_compute_cost_file_name
     last_compute_cost_file_name = profile_result_file_name
-    print(f"Profile result saved to: {profile_result_file_name}")
+    # print(f"Profile result saved to: {profile_result_file_name}")
     print("-" * 70)
+    ###################################################
 
     if auto_stage_option.layer_profile_mode == "composition":
         if inference_mode:
@@ -1377,10 +1450,19 @@ def get_compute_cost(
                 num_autosharding_configs)
             max_n_succ_stages = None
         else:
+            ###################################################
+            # Modified by crius
+            # (Original call)
+            # (compute_cost,
+            #  max_n_succ_stages) = interpret_profile_result_training_2d(
+            #      profile_results, num_layers, num_submesh_choices,
+            #      num_autosharding_configs)
+            # (Modified call)
             (compute_cost,
              max_n_succ_stages) = interpret_profile_result_training_2d(
                  profile_results, num_layers, num_submesh_choices,
-                 num_autosharding_configs)
+                 num_autosharding_configs, all_pruned_stages_indices)
+            ###################################################
     elif auto_stage_option.layer_profile_mode == "individual":
         if inference_mode:
             compute_cost, _ = interpret_profile_result_inference_1d(
