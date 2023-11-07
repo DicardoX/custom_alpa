@@ -57,6 +57,7 @@ GB = 1024**3
 
 ###################################################
 # Modified by crius
+import os
 # Infinite memory size (bytes)
 CRIUS_INF_MEMSIZE = 128 * 1024**3
 # Infinite compute cost
@@ -653,6 +654,23 @@ def profile_all(stages, compiled_outputs: Sequence[CompileOutput], meshes,
     return profile_results
 
 
+###################################################
+# Modified by crius
+# (Original api)
+# def generate_training_stages_2d(layers,
+#                                 layer_flops_prefix_sum,
+#                                 accumulator_mapping,
+#                                 acc_grad_invars,
+#                                 acc_grad_outvars,
+#                                 apply_grad_layers,
+#                                 apply_grad_global_info,
+#                                 mesh_id,
+#                                 autosharding_configs,
+#                                 mesh_num_devices,
+#                                 cluster_size,
+#                                 stage_imbalance_tolerance=np.inf):
+# (Modified api)
+###################################################
 def generate_training_stages_2d(layers,
                                 layer_flops_prefix_sum,
                                 accumulator_mapping,
@@ -664,7 +682,8 @@ def generate_training_stages_2d(layers,
                                 autosharding_configs,
                                 mesh_num_devices,
                                 cluster_size,
-                                stage_imbalance_tolerance=np.inf):
+                                stage_imbalance_tolerance=np.inf,
+                                pruned_stages_indices: Sequence[Tuple[int]] = None):
     print("- Generate all stage infos (Jaxpr -> HLO)")
     assert len(layers) % 2 == 0
     num_layers = len(layers) // 2
@@ -677,6 +696,7 @@ def generate_training_stages_2d(layers,
         for end in tqdm.tqdm(range(start, num_layers), leave=False):
             if is_full_mesh and not (start == 0 and end == num_layers - 1):
                 continue
+
             flops_ratio = (
                 layer_flops_prefix_sum[end + 1] - layer_flops_prefix_sum[start]
                 + layer_flops_prefix_sum[2 * num_layers - start] -
@@ -686,6 +706,20 @@ def generate_training_stages_2d(layers,
                     computation_source_ratio < flops_ratio /
                 (1 + stage_imbalance_tolerance)):
                 continue
+            
+            #######################
+            # Modified by crius
+            stage_idx = (start, end, mesh_id, 0)
+            if stage_idx in pruned_stages_indices:
+                # Skip compiling and profiling for this stage
+                for _i, _cfg in enumerate(autosharding_configs):
+                    if _cfg is not None:
+                        _stage_idx = (start, end, mesh_id, _i)
+                        stages.append(
+                            (_stage_idx, None, _cfg))
+                continue
+            #######################
+            
             forward_layer_indices = indices[start:end + 1]
             backward_layer_indices = indices[2 * num_layers - end -
                                              1:2 * num_layers - start]
@@ -953,7 +987,8 @@ def interpret_profile_result_training_2d(
         
         ###################################################
         # Modified by crius
-        if index in pruned_stages_indices:
+        prune_search_space = os.environ.get("PRUNE_SEARCH_SPACE", "false") == "true"
+        if prune_search_space and index in pruned_stages_indices:
             # Pruned stage
             print(f"[TMP] Stage {index} has been pruned...")
             all_compute_cost[index] = CRIUS_INF_COMP_COST
@@ -1178,8 +1213,8 @@ def check_profile_results_consistent(stages,
                     module_profile_config.outvar_names)
             assert (module_profile_result.donated_invars ==
                     module_profile_config.donated_invars)
-            assert (module_profile_result.required_outvars_indices ==
-                    module_profile_config.required_outvars_indices)
+            # assert (module_profile_result.required_outvars_indices ==
+            #         module_profile_config.required_outvars_indices)
 
 
 def _get_layer_flops_prefix_sum(layers):
@@ -1194,51 +1229,24 @@ def _get_layer_flops_prefix_sum(layers):
 #     Crius-Defined Function     #
 ##################################
 
-def crius_forge_stage_prof_results(mesh_num_devices: int, cluster_size: int, mesh_id: int, 
-                                   num_all_layers: int, layer_flops_prefix_sum: Sequence[int],
-                                   autosharding_configs: Any,
-                                   profile_results: dict,
-                                   imba_tolerance: float = np.inf):
+def _crius_violate_layer_coarsen_rule(layer_indices: Sequence[int], 
+                                      coarsened_indices_list: Sequence[Sequence[int]]):
     """ 
-    Forge fake profiling results for pruned stages after prohibiting allocating `mesh_num_devices` devices 
-    for one stage. This function is called in get_compute_cost() to compiling and profiling of pruned stages. 
-    ----------------------------------------------------------
-    Note:
-        - The workflow is basicly similar (but more lightweight) to generate_training_stages_2d(), skipping 
-          hlo generation.
+    Check whether the given layer indices of the stage violates the rule of layer coarsening. When one layer
+    in certain coarsened layer exists in layer indices, the rest layers in the same coarsened layer must also
+    exist. This method avoids directly merging jaxprs that leads to legacy unhandled errors.
     """
-    assert num_all_layers % 2 == 0, \
-        f"The number of forward + backward layers should be divisible by 2, got {num_all_layers}."
-    num_layers = num_all_layers // 2
-    # Resource quota for this submesh
-    resource_ratio = mesh_num_devices / cluster_size
-    is_full_mesh = resource_ratio == 1
-    # Total flops
-    total_flops = layer_flops_prefix_sum[2 * num_layers]
+    for _indices in coarsened_indices_list:
+        is_violated = not (all([_idx in layer_indices for _idx in _indices]) or 
+                           all([_idx not in layer_indices for _idx in _indices]))
+        if is_violated:
+            print(f"[TMP] Layer indices {layer_indices} violates the layer coarsening rules, pruned.")
+            return True
+    return False
 
-    # Get pruned stages
-    pruned_stages_indices = list()
-    for _s_idx in range(num_layers):
-        for _e_idx in range(_s_idx, num_layers):
-            if is_full_mesh and not (_s_idx == 0 and _e_idx == num_layers - 1):
-                # Must merge all layers for full mesh
-                continue
-            # Flops ratio
-            forward_layers_flops = layer_flops_prefix_sum[_e_idx + 1] - \
-                                        layer_flops_prefix_sum[_s_idx]
-            backward_layers_flops = layer_flops_prefix_sum[2 * num_layers - _s_idx] - \
-                                        layer_flops_prefix_sum[2 * num_layers - _e_idx - 1]
-            flops_ratio = (forward_layers_flops + backward_layers_flops) / total_flops
-            if (resource_ratio > flops_ratio * (1 + imba_tolerance) or 
-                resource_ratio < flops_ratio / (1 + imba_tolerance)):
-                # Exceed stage imbalance tolerance towards computing flops
-                continue
-            # Construct fake stages
-            for _i, _cfg in enumerate(autosharding_configs):
-                if _cfg is not None:
-                    _stage_idx = (_s_idx, _e_idx, mesh_id, _i)
-                    pruned_stages_indices.append(_stage_idx)
-    
+
+def _crius_forge_profile_results(pruned_stages_indices: Sequence[Any], profile_results: dict):
+    """ Forge fake profiling results for pruned stages to skip compiling and profiling.. """
     # Forge profiling results
     num_modules_per_stage = 2   # Forward + backward modules
     for _i, _stage_idx in enumerate(pruned_stages_indices):
@@ -1266,6 +1274,104 @@ def crius_forge_stage_prof_results(mesh_num_devices: int, cluster_size: int, mes
             f"Not all modules in stage {_stage_idx} are profiled."
 
     return profile_results, pruned_stages_indices
+
+
+def crius_coarsen_layers(mesh_num_devices: int, cluster_size: int, mesh_id: int, 
+                         num_all_layers: int, layer_flops_prefix_sum: Sequence[int],
+                         autosharding_configs: Any, 
+                         coarsened_indices_list: Sequence[Sequence[int]],
+                         profile_results: dict,
+                         imba_tolerance: float = np.inf):
+    """
+    Layer coarsening is considered to prune stages that violates the coarsening rule.
+    This function is called in get_compute_cost() to compiling and profiling of pruned stages. 
+    """
+    assert num_all_layers % 2 == 0, \
+        f"The number of forward + backward layers should be divisible by 2, got {num_all_layers}."
+    num_layers = num_all_layers // 2
+    # Resource quota for this submesh
+    resource_ratio = mesh_num_devices / cluster_size
+    is_full_mesh = resource_ratio == 1
+    # Total flops
+    total_flops = layer_flops_prefix_sum[2 * num_layers]
+    
+    # Get pruned stages
+    pruned_stages_indices = list()
+    for _s_idx in range(num_layers):
+        for _e_idx in range(_s_idx, num_layers):
+            if is_full_mesh and not (_s_idx == 0 and _e_idx == num_layers - 1):
+                # Must merge all layers for full mesh
+                continue
+
+            # Flops ratio
+            forward_layers_flops = layer_flops_prefix_sum[_e_idx + 1] - \
+                                        layer_flops_prefix_sum[_s_idx]
+            backward_layers_flops = layer_flops_prefix_sum[2 * num_layers - _s_idx] - \
+                                        layer_flops_prefix_sum[2 * num_layers - _e_idx - 1]
+            flops_ratio = (forward_layers_flops + backward_layers_flops) / total_flops
+            if (resource_ratio > flops_ratio * (1 + imba_tolerance) or 
+                resource_ratio < flops_ratio / (1 + imba_tolerance)):
+                # Exceed stage imbalance tolerance towards computing flops
+                continue
+            
+            if _crius_violate_layer_coarsen_rule(layer_indices=list(np.arange(_s_idx, _e_idx + 1)),
+                                                 coarsened_indices_list=coarsened_indices_list):
+                # Violate layer coarsening rules        
+                for _i, _cfg in enumerate(autosharding_configs):
+                    if _cfg is not None:
+                        _stage_idx = (_s_idx, _e_idx, mesh_id, _i)
+                        pruned_stages_indices.append(_stage_idx)
+    
+    return _crius_forge_profile_results(pruned_stages_indices, profile_results)
+
+
+def crius_prune_mesh_num_devices(mesh_num_devices: int, cluster_size: int, mesh_id: int, 
+                                   num_all_layers: int, layer_flops_prefix_sum: Sequence[int],
+                                   autosharding_configs: Any,
+                                   profile_results: dict,
+                                   imba_tolerance: float = np.inf):
+    """ 
+    Prohibiting allocate `mesh_num_devices` devices for one stage.
+    This function is called in get_compute_cost() to compiling and profiling of pruned stages. 
+    ----------------------------------------------------------
+    Note:
+        - The workflow is basicly similar (but more lightweight) to generate_training_stages_2d(), skipping 
+          hlo generation.
+    """
+    assert num_all_layers % 2 == 0, \
+        f"The number of forward + backward layers should be divisible by 2, got {num_all_layers}."
+    num_layers = num_all_layers // 2
+    # Resource quota for this submesh
+    resource_ratio = mesh_num_devices / cluster_size
+    is_full_mesh = resource_ratio == 1
+    # Total flops
+    total_flops = layer_flops_prefix_sum[2 * num_layers]
+    
+    # Get pruned stages
+    pruned_stages_indices = list()
+    for _s_idx in range(num_layers):
+        for _e_idx in range(_s_idx, num_layers):
+            if is_full_mesh and not (_s_idx == 0 and _e_idx == num_layers - 1):
+                # Must merge all layers for full mesh
+                continue
+
+            # Flops ratio
+            forward_layers_flops = layer_flops_prefix_sum[_e_idx + 1] - \
+                                        layer_flops_prefix_sum[_s_idx]
+            backward_layers_flops = layer_flops_prefix_sum[2 * num_layers - _s_idx] - \
+                                        layer_flops_prefix_sum[2 * num_layers - _e_idx - 1]
+            flops_ratio = (forward_layers_flops + backward_layers_flops) / total_flops
+            if (resource_ratio > flops_ratio * (1 + imba_tolerance) or 
+                resource_ratio < flops_ratio / (1 + imba_tolerance)):
+                # Exceed stage imbalance tolerance towards computing flops
+                continue
+            # Construct fake stages
+            for _i, _cfg in enumerate(autosharding_configs):
+                if _cfg is not None:
+                    _stage_idx = (_s_idx, _e_idx, mesh_id, _i)
+                    pruned_stages_indices.append(_stage_idx)
+    
+    return _crius_forge_profile_results(pruned_stages_indices, profile_results)
 
 
 ##################################
@@ -1363,9 +1469,12 @@ def get_compute_cost(
 
     ################################
     # Modified by crius
-    max_num_gpus_per_stage = 2
-    min_num_gpus_per_stage = 1
     all_pruned_stages_indices = list()
+    prune_search_space = os.environ.get("PRUNE_SEARCH_SPACE", "false") == "true"
+    if prune_search_space:
+        # TODO(chunyu): Obtain upper and lower bound of device num per stage
+        max_num_gpus_per_stage = 2
+        min_num_gpus_per_stage = 1
     ################################
     
     # Reverse submesh_choices to test larger meshes first
@@ -1386,17 +1495,18 @@ def get_compute_cost(
         
         #####################################
         # Modified by crius
-        if sliced_virtual_meshes[0].num_devices > max_num_gpus_per_stage or \
-            sliced_virtual_meshes[0].num_devices < min_num_gpus_per_stage:
-            # Forge profiling results of pruned stages, skipping compiling and profiling.
+        if prune_search_space and \
+                (sliced_virtual_meshes[0].num_devices > max_num_gpus_per_stage or 
+                 sliced_virtual_meshes[0].num_devices < min_num_gpus_per_stage):
+            # Pruned by mesh device num rules
             print("")
             print(f"[TMP] Since submesh device num ({sliced_virtual_meshes[0].num_devices}) " + 
-                  f"> max gpu num per stage ({max_num_gpus_per_stage}) or < min gpu num per " + 
-                  f"stage ({min_num_gpus_per_stage}), skip compiling and profiling " + 
-                  f"on pruned stages and forge infeasible profiling results for them ...")
+                f"> max gpu num per stage ({max_num_gpus_per_stage}) or < min gpu num per " + 
+                f"stage ({min_num_gpus_per_stage}), skip compiling and profiling " + 
+                f"on pruned stages and forge infeasible profiling results for them ...")
             print("-" * 50)
             print("")
-            profile_results, pruned_stages_indices = crius_forge_stage_prof_results(
+            profile_results, pruned_stages_indices = crius_prune_mesh_num_devices(
                 mesh_num_devices=sliced_virtual_meshes[0].num_devices,
                 cluster_size=cluster_size, mesh_id=mesh_id, 
                 num_all_layers=len(layers), layer_flops_prefix_sum=layer_flops_prefix_sum,
@@ -1404,7 +1514,20 @@ def get_compute_cost(
                 profile_results=profile_results, 
                 imba_tolerance=auto_stage_option.stage_imbalance_tolerance)
             all_pruned_stages_indices.extend(pruned_stages_indices)
+            # Skip compiling and profiling
             continue
+            
+        if prune_search_space and coarsened_indices_list is not None:
+            # Pruned by layer coarsening rules
+            profile_results, pruned_stages_indices = crius_coarsen_layers(
+                mesh_num_devices=sliced_virtual_meshes[0].num_devices,
+                cluster_size=cluster_size, mesh_id=mesh_id, 
+                num_all_layers=len(layers), layer_flops_prefix_sum=layer_flops_prefix_sum,
+                autosharding_configs=autosharding_configs[mesh_id], 
+                coarsened_indices_list=coarsened_indices_list,
+                profile_results=profile_results, 
+                imba_tolerance=auto_stage_option.stage_imbalance_tolerance)
+            all_pruned_stages_indices.extend(pruned_stages_indices)
         #####################################
 
 
@@ -1418,13 +1541,26 @@ def get_compute_cost(
                     sliced_virtual_meshes[0].num_devices, cluster_size,
                     auto_stage_option.stage_imbalance_tolerance)
             else:
+                #################################
+                # Modified by crius
+                # (Original call)
+                # stages = generate_training_stages_2d(
+                #     layers, layer_flops_prefix_sum, accumulator_mapping,
+                #     acc_grad_invars, acc_grad_outvars, apply_grad_layers,
+                #     apply_grad_global_info, mesh_id,
+                #     autosharding_configs[mesh_id],
+                #     sliced_virtual_meshes[0].num_devices, cluster_size,
+                #     auto_stage_option.stage_imbalance_tolerance)
+                # (Modified call)
                 stages = generate_training_stages_2d(
                     layers, layer_flops_prefix_sum, accumulator_mapping,
                     acc_grad_invars, acc_grad_outvars, apply_grad_layers,
                     apply_grad_global_info, mesh_id,
                     autosharding_configs[mesh_id],
                     sliced_virtual_meshes[0].num_devices, cluster_size,
-                    auto_stage_option.stage_imbalance_tolerance)
+                    auto_stage_option.stage_imbalance_tolerance,
+                    all_pruned_stages_indices)
+                #################################
         elif auto_stage_option.layer_profile_mode == "individual":
             if inference_mode:
                 stages = generate_inference_stages_1d(
@@ -1440,7 +1576,7 @@ def get_compute_cost(
             raise ValueError(f"Unknown layer profile mode: "
                              f"{auto_stage_option.layer_profile_mode}")
 
-        check_profile_results_consistent(stages, profile_results)
+        # check_profile_results_consistent(stages, profile_results)
 
         profile_results = distributed_profile_on_mesh(
             stages, sliced_virtual_meshes, num_micro_batches, default_as_option,

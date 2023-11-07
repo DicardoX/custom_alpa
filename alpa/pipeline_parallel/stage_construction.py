@@ -22,6 +22,7 @@ from alpa.util import OrderedSet, maybe_numba_jit, jaxpr_to_hlo
 
 ########################
 # Modified by crius
+import os
 from jax.core import (gensym, Jaxpr, ClosedJaxpr, DropVar)
 from alpa.pipeline_parallel.stage_profiling import (
     _get_layer_flops_prefix_sum, select_module_layers)
@@ -587,135 +588,6 @@ def get_sliced_virtual_submeshes(virtual_mesh, submesh_shapes):
 #     Crius-Defined Function     #
 ##################################
 
-def _crius_coarsen_layers(layers: Sequence[JaxPipelineComputation], 
-                        coarsened_indices_list: Sequence[Sequence[int]], 
-                        acc_grad_invars: Sequence[Var],
-                        acc_grad_outvars: Sequence[Var],
-                        donation_map: Dict[Var, Var],
-                        name: str = "coarsened_layer"):
-    """ 
-    Merge jaxpr layers to be coarsened as one layer. Refer to: 
-    computation.py/merge_unmarked_with_call(). 
-    """
-    coarsened_layers = list()
-
-    for _indices in coarsened_indices_list:
-        # For each coarsened layer
-        invars, outvars = OrderedSet(), OrderedSet()
-        intermediates = OrderedSet()
-        # sliced_eqns = list()
-        merged_eqns = list()
-        const_dir = {}
-        # Merge layers
-        to_merged_layers = [layers[_j] for _j in _indices]
-        gensym_fn = gensym([_layer.closed_jaxpr().jaxpr for _layer in to_merged_layers])
-        for _layer in to_merged_layers:
-            _closed_jaxpr = _layer.closed_jaxpr()
-            # sliced_eqns.append(_layer.eqns[1:-1])   # Remove pipeline marker
-            merged_eqns.extend(_layer.eqns[1:-1])   # Remove pipeline marker
-            invars.update(_closed_jaxpr.jaxpr.invars)
-            intermediates.update(_closed_jaxpr.jaxpr.outvars)
-            outvars.update(_closed_jaxpr.jaxpr.outvars)
-            const_dir.update(zip(_closed_jaxpr.jaxpr.constvars, _closed_jaxpr.consts))
-        # Remove intermediates
-        invars.difference_update(intermediates)
-        # Update outvars
-        outvars.intersection_update(acc_grad_outvars)
-        # Handle donation
-        if donation_map:
-            invars, outvars, _ = _rearrange_in_out_for_donation(
-                invars, outvars, donation_map)
-        # Jaxpr
-        # jaxpr = Jaxpr(const_dir.keys(), invars, outvars, merged_eqns)
-        jaxpr = Jaxpr(const_dir.keys(), invars, acc_grad_outvars, merged_eqns)
-        # # Warp with marker
-        # jaxpr = _wrap_by_marker(jaxpr, name, gensym_fn)
-        # Closed jaxpr
-        closed_jaxpr = ClosedJaxpr(jaxpr, const_dir.values())
-        # Add pipeline markers
-        # closed_jaxpr = add_pipeline_marks_for_sliced_eqns(closed_jaxpr, [merged_eqns])
-
-        coarsened_layers.append(
-            JaxPipelineComputation.from_closed_jaxpr(name, closed_jaxpr)
-        )
-
-    return coarsened_layers
-
-
-def _crius_merge_marked_jaxprs_without_named_call(jaxprs: Sequence[ClosedJaxpr],
-                                                    may_outvars: OrderedSet[Var],
-                                                    donation_map=None,
-                                                    prefix=None,
-                                                    wrap_with_marker=False,
-                                                    gensym_fn=None):
-    """ 
-    Merge jaxpr layers to be coarsened as one layer. Refer to: 
-    computation.py/merge_marked_jaxprs_with_named_call(). 
-    """
-    
-    def unwrap_without_call(jaxpr, name):
-        used_var = OrderedSet()
-        for eqn in jaxpr.eqns[1:-1]:
-            used_var.update([var for var in eqn.invars if isinstance(var, Var)])
-        used_var.intersection_update(jaxpr.eqns[0].outvars)
-        new_invars = {}
-        for invar, outvar in zip(jaxpr.eqns[0].invars, jaxpr.eqns[0].outvars):
-            if outvar in used_var:
-                new_invars[outvar] = invar
-        new_jaxpr = clone_jaxpr(jaxpr, new_invars.keys(), jaxpr.eqns[-1].invars,
-                                jaxpr.eqns[1:-1])
-        return jaxpr.eqns[1:-1], list(new_invars.keys()), jaxpr.eqns[-1].invars
-    
-    def has_output(jaxpr):
-        return len([v for v in jaxpr.outvars if not isinstance(v, DropVar)])
-    
-    def __wrap_by_marker(jaxpr: Jaxpr, name, gensym_fn):
-        eqns = []
-        new_invars = list(jaxpr.invars)
-        new_outvars = list(jaxpr.outvars)
-        # sym_invars = [gensym_fn(var.aval) for var in new_invars]
-        # sym_outvars = [gensym_fn(var.aval) for var in new_outvars]
-        eqns.append(mark_pipeline_jaxpreqn(new_invars, jaxpr.invars, name, "start"))
-        params = dict(name=name,
-                    call_jaxpr=Jaxpr([], new_invars + jaxpr.constvars,
-                                    new_outvars, jaxpr.eqns))
-        eqns.extend(jaxpr.eqns)
-        eqns.append(mark_pipeline_jaxpreqn(jaxpr.outvars, new_outvars, name, "end"))
-        return Jaxpr(list(jaxpr.constvars), list(jaxpr.invars), new_outvars, eqns)
-    
-    name_prefix = prefix or ""
-    new_eqns = []
-    invars = []
-    env = OrderedSet()
-    const_dir = {}
-    outvars = OrderedSet()
-    gensym_fn = gensym_fn or gensym([j.jaxpr for j in jaxprs])
-    # Merge everything together
-    for i, jaxpr in enumerate(jaxprs):
-        const_dir.update(zip(jaxpr.jaxpr.constvars, jaxpr.consts))
-        env.update(jaxpr.jaxpr.constvars)
-        if has_output(jaxpr.jaxpr):
-            _eqns, _invars, _outvars = unwrap_without_call(jaxpr, name_prefix + str(i))
-            # new_eqns.append(call_eqn)
-            new_eqns.extend(_eqns)
-            invars.extend(OrderedSet(_invars).difference(env))
-            env.update(_invars + _outvars)
-        outvars.update(jaxpr.jaxpr.outvars)
-    outvars.intersection_update(may_outvars)
-
-    # handle donation
-    if donation_map:
-        invars, outvars, _ = _rearrange_in_out_for_donation(
-            invars, outvars, donation_map)
-    # wrap with marker
-    jaxpr = Jaxpr(const_dir.keys(), invars, outvars, new_eqns)
-    if wrap_with_marker:
-        jaxpr = __wrap_by_marker(jaxpr, prefix, gensym_fn)
-    closed_jaxpr = ClosedJaxpr(jaxpr, const_dir.values())
-
-    return closed_jaxpr
-
-
 def crius_coarsen_layers_near_uniform(layers: Sequence[JaxPipelineComputation], 
                                       max_num_stages: int, min_num_stages: int,
                                       acc_grad_invars: Sequence[Var],
@@ -734,7 +606,7 @@ def crius_coarsen_layers_near_uniform(layers: Sequence[JaxPipelineComputation],
 
     if lcm >= num_layers:
         print(f"[I] No layer coarsen is performed with LCM = {lcm} but there are only {num_layers} layers.")
-        return layers
+        return None
 
     print(f"[I] Coarsening pipeline layers from {num_layers} to {lcm}...")
     # # Layer flops list
@@ -799,65 +671,6 @@ def crius_coarsen_layers_near_uniform(layers: Sequence[JaxPipelineComputation],
     print(f"[I] Coarsened scheme: {coarsened_indices_list}")
     
     return coarsened_indices_list
-    
-    # Add backward coarsened indices
-    backward_coarsened_indices_list = list()
-    for _indices in coarsened_indices_list:
-        _backward_indices = [2 * num_layers - _idx - 1 for _idx in _indices]
-        _backward_indices.reverse()
-        backward_coarsened_indices_list.append(_backward_indices)
-    backward_coarsened_indices_list.reverse()
-    coarsened_indices_list.extend(backward_coarsened_indices_list)
-    
-    print(f"[I] Coarsened scheme: {coarsened_indices_list}")
-    
-    assert len(coarsened_indices_list) == lcm * 2, \
-        f"After coarsened, there are {len(coarsened_indices_list)} coarsened layers " + \
-        f"while we need {lcm * 2}."
-    
-    # Merge coarsened layers
-    # coarsened_layers = _crius_coarsen_layers(layers, coarsened_indices_list, 
-    #                                          acc_grad_invars, acc_grad_outvars,
-    #                                          accumulator_mapping)
-
-    coarsened_layer_outvars = get_stage_outvars(layers, coarsened_indices_list, acc_grad_outvars)
-    
-    # Merge coarsened layers
-    coarsened_layers = list()
-    for _i, _indices in enumerate(coarsened_indices_list):
-
-        if len(_indices) == 1:
-            # Single layer
-            coarsened_layers.append(layers[_indices[0]])
-            continue
-        # Multi layers
-        layers_jaxprs = [layers[_j].closed_jaxpr() for _j in _indices]
-        layer_name = f"coarsened_layer_{_i}"
-        # coarsened_layer_jaxpr = merge_marked_jaxprs_with_named_call(layers_jaxprs,
-        #                                                             coarsened_layer_outvars[_i],
-        #                                                             accumulator_mapping,
-        #                                                             layer_name,
-        #                                                             wrap_with_marker=True)
-        coarsened_layer_jaxpr = _crius_merge_marked_jaxprs_without_named_call(layers_jaxprs,
-                                                                    coarsened_layer_outvars[_i],
-                                                                    accumulator_mapping,
-                                                                    layer_name,
-                                                                    wrap_with_marker=True)
-        coarsened_layers.append(
-            JaxPipelineComputation.from_closed_jaxpr(layer_name, coarsened_layer_jaxpr)
-        )
-    
-    for _layer in coarsened_layers:
-        print(len(_layer.eqns))
-    
-    layer_flops = sum(eqn_flops(eqn) for eqn in coarsened_layers[0].eqns)
-    
-    print(layer_flops)
-    print(_get_layer_flops_prefix_sum(coarsened_layers))
-
-    # exit(0)
-    
-    return coarsened_layers
 
 
 def cluster_layers_and_slice_mesh(
@@ -894,12 +707,19 @@ def cluster_layers_and_slice_mesh(
 
     ################################
     # Modified by crius
-    max_num_stages = 4
-    min_num_stages = 4
-
-    coarsened_indices_list = crius_coarsen_layers_near_uniform(layers, max_num_stages, min_num_stages,
-                                                               acc_grad_invars, acc_grad_outvars, 
-                                                               accumulator_mapping)
+    prune_search_space = os.environ.get("PRUNE_SEARCH_SPACE", "false") == "true"
+    if prune_search_space:
+        # TODO(chunyu): Obtain upper and lower bound of stage num
+        max_num_stages = 4
+        min_num_stages = 4
+        # Coarsen layers
+        coarsened_indices_list = crius_coarsen_layers_near_uniform(layers, max_num_stages, 
+                                                                   min_num_stages,
+                                                                   acc_grad_invars, 
+                                                                   acc_grad_outvars, 
+                                                                   accumulator_mapping)
+    else:
+        coarsened_indices_list = None
     ################################
     
     inference_mode = (pipeline_schedule == "inference")
@@ -941,7 +761,7 @@ def cluster_layers_and_slice_mesh(
             default_as_option, stage_option, inference_mode, 
             coarsened_indices_list)
         ##################################
-        
+
         if inference_mode:
             _, solution = inference_dp(num_layers, virtual_mesh.num_devices,
                                        submesh_choices,
