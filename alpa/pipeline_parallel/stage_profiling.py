@@ -1268,6 +1268,26 @@ def crius_forge_stage_prof_results(mesh_num_devices: int, cluster_size: int, mes
     return profile_results, pruned_stages_indices
 
 
+##################################
+# Modified by crius
+# (Original api)
+# def get_compute_cost(
+#         virtual_mesh: VirtualPhysicalMesh,
+#         submesh_choices: Sequence[Tuple[int]],
+#         autosharding_configs: Sequence[Sequence[Tuple[LogicalDeviceMesh,
+#                                                       dict]]],
+#         layers: Sequence[JaxPipelineComputation],
+#         accumulator_mapping: Dict[Var, Var],
+#         acc_grad_invars: Sequence[Var],
+#         acc_grad_outvars: Sequence[Var],
+#         apply_grad_layers: Sequence[JaxPipelineComputation],
+#         apply_grad_global_info: Tuple,
+#         num_micro_batches: int,
+#         default_as_option: AutoShardingOption,
+#         auto_stage_option: "AutoStageOption",
+#         inference_mode: bool = False):
+# (Modified api)
+####################################
 def get_compute_cost(
         virtual_mesh: VirtualPhysicalMesh,
         submesh_choices: Sequence[Tuple[int]],
@@ -1282,7 +1302,8 @@ def get_compute_cost(
         num_micro_batches: int,
         default_as_option: AutoShardingOption,
         auto_stage_option: "AutoStageOption",
-        inference_mode: bool = False):
+        inference_mode: bool = False,
+        coarsened_indices_list: Sequence[Sequence[int]] = None):
     """Get computation cost for each possible (stage, mesh) configuration.
 
     This function enumerates all given submesh choices, then profiles compute

@@ -27,6 +27,7 @@ def eqn_flops(eqn: JaxprEqn) -> float:
     backend = xb.get_backend("cpu")
     properties = xc._xla.hlo_module_cost_analysis(  # pylint: disable=protected-access
         backend, hlo_module)
+    
     return properties["flops"] if "flops" in properties else 0.0
 
 
