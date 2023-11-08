@@ -589,10 +589,7 @@ def get_sliced_virtual_submeshes(virtual_mesh, submesh_shapes):
 ##################################
 
 def crius_coarsen_layers_near_uniform(layers: Sequence[JaxPipelineComputation], 
-                                      max_num_stages: int, min_num_stages: int,
-                                      acc_grad_invars: Sequence[Var],
-                                      acc_grad_outvars: Sequence[Var],
-                                      accumulator_mapping: Dict[Var, Var]):
+                                      max_num_stages: int, min_num_stages: int):
     """ 
     Further coarsen pipeline layers with the given upper/lower bound of stage num 
     near-uniformly. To avoid the suboptimal introduced by coarsening layers, we need 
@@ -604,6 +601,10 @@ def crius_coarsen_layers_near_uniform(layers: Sequence[JaxPipelineComputation],
     num_layers = len(layers) // 2
     lcm = np.lcm.reduce(np.arange(min_num_stages, max_num_stages + 1))
 
+    overwrite_lcm = os.environ.get("CRIUS_OVERWRITE_LCM", "none")
+    if overwrite_lcm != "none":
+        lcm = int(overwrite_lcm)
+    
     if lcm >= num_layers:
         print(f"[I] No layer coarsen is performed with LCM = {lcm} but there are only {num_layers} layers.")
         return None
@@ -709,15 +710,16 @@ def cluster_layers_and_slice_mesh(
     # Modified by crius
     prune_search_space = os.environ.get("PRUNE_SEARCH_SPACE", "false") == "true"
     if prune_search_space:
-        # TODO(chunyu): Obtain upper and lower bound of stage num
-        max_num_stages = 4
-        min_num_stages = 4
+        # Obtain upper and lower bound of stage num
+        prompt = os.environ.get("CRIUS_PRUNE_PROMPT")
+        (l_p, h_p, l_d, h_d, l_m, h_m) = [int(_c) for _c in prompt.split("_")]
+        num_devices = int(os.environ.get("CRIUS_GLOBAL_DEVICE_NUM"))
+        max_num_stages = min(h_p, int(np.ceil(num_devices / (l_d * l_m))))
+        min_num_stages = max(l_p, int(np.floor(num_devices / (h_d * h_m))))
+        print(f"[TMP] The range of stage num is: {min_num_stages} -> {max_num_stages}")
         # Coarsen layers
         coarsened_indices_list = crius_coarsen_layers_near_uniform(layers, max_num_stages, 
-                                                                   min_num_stages,
-                                                                   acc_grad_invars, 
-                                                                   acc_grad_outvars, 
-                                                                   accumulator_mapping)
+                                                                   min_num_stages)
     else:
         coarsened_indices_list = None
     ################################

@@ -1472,9 +1472,13 @@ def get_compute_cost(
     all_pruned_stages_indices = list()
     prune_search_space = os.environ.get("PRUNE_SEARCH_SPACE", "false") == "true"
     if prune_search_space:
-        # TODO(chunyu): Obtain upper and lower bound of device num per stage
-        max_num_gpus_per_stage = 2
-        min_num_gpus_per_stage = 1
+        # Obtain upper and lower bound of device num per stage
+        prompt = os.environ.get("CRIUS_PRUNE_PROMPT")
+        (l_p, h_p, l_d, h_d, l_m, h_m) = [int(_c) for _c in prompt.split("_")]
+        num_devices = int(os.environ.get("CRIUS_GLOBAL_DEVICE_NUM"))
+        max_num_gpus_per_stage = min(int(np.ceil(num_devices / l_p)), (h_d * h_m))
+        min_num_gpus_per_stage = max(int(np.floor(num_devices / h_p)), (l_d * l_m))
+        print(f"[TMP] The range of device num per stage is: {min_num_gpus_per_stage} -> {max_num_gpus_per_stage}")
     ################################
     
     # Reverse submesh_choices to test larger meshes first
