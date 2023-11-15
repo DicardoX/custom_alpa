@@ -9,6 +9,8 @@ class GlobalConfig:
         ########## Options of device mesh ##########
         self.backend = "gpu"
         self.has_cuda = os.system("nvidia-smi > /dev/null 2>&1") == 0
+        # Overwrite in case that the container cannot detact devices through nividia-smi
+        self.has_cuda = True
 
         # See https://jax.readthedocs.io/en/latest/gpu_memory_allocation.html
         self.xla_client_mem_fraction = float(
