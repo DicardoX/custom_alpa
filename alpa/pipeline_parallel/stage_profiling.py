@@ -987,8 +987,9 @@ def interpret_profile_result_training_2d(
         
         ###################################################
         # Modified by crius
-        prune_search_space = os.environ.get("PRUNE_SEARCH_SPACE", "false") == "true"
-        if prune_search_space and index in pruned_stages_indices:
+        # prune_search_space = os.environ.get("PRUNE_SEARCH_SPACE", "false") == "true"
+        # if prune_search_space and index in pruned_stages_indices:
+        if index in pruned_stages_indices:
             # Pruned stage
             print(f"[TMP] Stage {index} has been pruned...")
             all_compute_cost[index] = CRIUS_INF_COMP_COST
@@ -1495,10 +1496,25 @@ def get_compute_cost(
         else:
             sliced_virtual_meshes = virtual_mesh.slice_profiling_submeshes(
                 num_hosts, num_devices_per_host)
-            
-        
+
         #####################################
         # Modified by crius
+        # To skip legacy error in tensorflow xla
+        # if sliced_virtual_meshes[0].num_hosts > 1:
+        if sliced_virtual_meshes[0].num_hosts > 1 and sliced_virtual_meshes[0].num_hosts < len(ray.nodes()):
+            # Pruned 
+            print(f"[TMP] Skip profiling of {sliced_virtual_meshes[0].num_hosts} due to legacy error in tensorflow...")
+            profile_results, pruned_stages_indices = crius_prune_mesh_num_devices(
+                mesh_num_devices=sliced_virtual_meshes[0].num_devices,
+                cluster_size=cluster_size, mesh_id=mesh_id, 
+                num_all_layers=len(layers), layer_flops_prefix_sum=layer_flops_prefix_sum,
+                autosharding_configs=autosharding_configs[mesh_id], 
+                profile_results=profile_results, 
+                imba_tolerance=auto_stage_option.stage_imbalance_tolerance)
+            all_pruned_stages_indices.extend(pruned_stages_indices)
+            # Skip compiling and profiling
+            continue
+
         if prune_search_space and \
                 (sliced_virtual_meshes[0].num_devices > max_num_gpus_per_stage or 
                  sliced_virtual_meshes[0].num_devices < min_num_gpus_per_stage):
