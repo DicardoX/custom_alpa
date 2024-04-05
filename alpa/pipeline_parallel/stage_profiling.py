@@ -1479,7 +1479,8 @@ def get_compute_cost(
         num_devices = int(os.environ.get("CRIUS_GLOBAL_DEVICE_NUM"))
         max_num_gpus_per_stage = min(int(np.ceil(num_devices / l_p)), (h_d * h_m))
         min_num_gpus_per_stage = max(int(np.floor(num_devices / h_p)), (l_d * l_m))
-        print(f"[TMP] The range of device num per stage is: {min_num_gpus_per_stage} -> {max_num_gpus_per_stage}")
+        print(f"[TMP] The range of device num per stage is (min #gpu -> " + 
+              f"max #gpu): {min_num_gpus_per_stage} -> {max_num_gpus_per_stage}")
     ################################
     
     # Reverse submesh_choices to test larger meshes first
@@ -1501,7 +1502,8 @@ def get_compute_cost(
         # Modified by crius
         # To skip legacy error in tensorflow xla
         # if sliced_virtual_meshes[0].num_hosts > 1:
-        if sliced_virtual_meshes[0].num_hosts > 1 and sliced_virtual_meshes[0].num_hosts < len(ray.nodes()):
+        if (os.environ.get("CRIUS_SKIP_LEGACY_ERROR", "false") == "true" and sliced_virtual_meshes[0].num_hosts > 1 and 
+            sliced_virtual_meshes[0].num_hosts < len(ray.nodes())):
             # Pruned 
             print(f"[TMP] Skip profiling of {sliced_virtual_meshes[0].num_hosts} due to legacy error in tensorflow...")
             profile_results, pruned_stages_indices = crius_prune_mesh_num_devices(

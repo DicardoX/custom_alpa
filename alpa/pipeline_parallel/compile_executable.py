@@ -42,11 +42,6 @@ from alpa.shard_parallel.manual_sharding import (ManualShardingOption,
 from alpa.util import (get_var_mapping, trace_jaxpr_with_micro_batch,
                        OrderedSet, GradFuncTransformContext)
 
-#####################
-# Modified by crius
-from alpa.pipeline_parallel.layer_construction import AutoLayerOption
-#####################
-
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -79,15 +74,6 @@ def compile_pipeshard_executable(
         raise NotImplementedError("Pipeshard Parallel for tpu is not supported")
     debug_compilation_time(None)
     name_base = f"{fun.__name__}_pipeshard_parallel"
-
-    # ################################
-    # # Modified by crius
-    # max_num_stages = 4
-    # min_num_stages = 4
-
-    # if isinstance(layer_option, AutoLayerOption):
-    #     layer_option.layer_num = 4
-    # ################################
     
     # Apply layer construction to add pipeline markers.
     with GradFuncTransformContext(layer_option.transform):

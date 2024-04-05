@@ -588,76 +588,64 @@ def get_sliced_virtual_submeshes(virtual_mesh, submesh_shapes):
 #     Crius-Defined Function     #
 ##################################
 
-def crius_coarsen_layers_near_uniform(layers: Sequence[JaxPipelineComputation], 
-                                      max_num_stages: int, min_num_stages: int):
+def crius_manual_tuning_coarsen_layers(
+    layers: Sequence[JaxPipelineComputation], 
+    max_num_stages: int, 
+    min_num_stages: int,
+) -> List[List[int]]:
     """ 
-    Further coarsen pipeline layers with the given upper/lower bound of stage num 
-    near-uniformly. To avoid the suboptimal introduced by coarsening layers, we need 
-    to best-effort support uniform slicing for varying stage num. Thus, we coarsen
-    layers near-uniformly with the amount of the lcm of all candidate stage num.
+    Coarsen layers based on layer FLOPs w.r.t. max/min stage num in manual tuning. 
     """
+
     assert len(layers) % 2 == 0, \
         f"The number of forward + backward layers should be divisible by 2, got {len(layers)}."
     num_layers = len(layers) // 2
-    lcm = np.lcm.reduce(np.arange(min_num_stages, max_num_stages + 1))
-
-    overwrite_lcm = os.environ.get("CRIUS_OVERWRITE_LCM", "none")
-    if overwrite_lcm != "none":
-        lcm = int(overwrite_lcm)
+    # Coarsen layers into `max_num_stages` layers
+    coarsened_layer_num = max_num_stages
+    # Overwrite if specified
+    overwrite_layer_num = os.environ.get("CRIUS_OVERWRITE_LAYER_NUM", "none")
+    if overwrite_layer_num != "none":
+        coarsened_layer_num = int(overwrite_layer_num)
     
-    if lcm >= num_layers:
-        print(f"[I] No layer coarsen is performed with LCM = {lcm} but there are only {num_layers} layers.")
+    if coarsened_layer_num >= num_layers:
+        print(f"[I] No layer coarsen is performed with expected coarsened layer num " + 
+              f"= {coarsened_layer_num} but there are only {num_layers} layers.")
         return None
 
-    print(f"[I] Coarsening pipeline layers from {num_layers} to {lcm}...")
-    # # Layer flops list
-    # _layer_flops_list = [sum(eqn_flops(_eqn) for _eqn in _layer.eqns) for _layer in layers]
-    # # Merge forward and backward flops of the same layer
-    # layer_flops_list = [_layer_flops_list[_i] + _layer_flops_list[2 * num_layers - _i - 1] for _i in range(num_layers)]
+    print(f"[I] Coarsening pipeline layers from {num_layers} to {coarsened_layer_num}...")
 
     # Layer flops prefix sum
     layer_flops_prefix_sum = _get_layer_flops_prefix_sum(layers)
     total_flops = layer_flops_prefix_sum[2 * num_layers]
-    tgt_ratio = 1 / lcm
-
-    def __best_effort_uniform_coarsen_layers(layer_flops_list, num_coarsen_layers):
-        """ Coarsen layers in best-effort uniform manner. """
-        # TODO(chunyu): Implement this with more tailored algorithm.
-
-    # # Generate coarsen indices for layers
-    # coarsened_indices_list = __best_effort_uniform_coarsen_layers(layer_flops_list, lcm)
+    target_ratio = 1 / coarsened_layer_num
 
     # Generate coarsen indices for layers
-    coarsened_indices_list = list()
+    coarsened_indices_list = []
     s_idx, e_idx = 0, 0
     last_flops_ratio = 0.0
+
     while e_idx < num_layers:
-        if len(coarsened_indices_list) == lcm - 1:
+        if len(coarsened_indices_list) == coarsened_layer_num - 1:
             # Coarsen all remained layers
             coarsened_indices_list.append(list(np.arange(s_idx, num_layers)))
             break
 
-        if lcm - len(coarsened_indices_list) == num_layers - s_idx:
-            # Treat each remained layer as coarsened layer
+        if coarsened_layer_num - len(coarsened_indices_list) == num_layers - s_idx:
+            # Treat each remained layer as a coarsened layer
             for _i in range(s_idx, num_layers, 1):
                 coarsened_indices_list.append([_i])
             break
 
-        # Flop ratios
+        # Flops ratios
         forward_layers_flops = layer_flops_prefix_sum[e_idx + 1] - \
                                         layer_flops_prefix_sum[s_idx]
         backward_layers_flops = layer_flops_prefix_sum[2 * num_layers - s_idx] - \
                                     layer_flops_prefix_sum[2 * num_layers - e_idx - 1]
         flops_ratio = (forward_layers_flops + backward_layers_flops) / total_flops
         
-        # print(flops_ratio)
-        # print(s_idx, e_idx)
-        
-        if flops_ratio >= tgt_ratio:
-            # print("")
-            
+        if flops_ratio >= target_ratio:
             # Coarsened as one layer
-            if np.abs(last_flops_ratio - tgt_ratio) < np.abs(flops_ratio - tgt_ratio) and e_idx > s_idx:
+            if np.abs(last_flops_ratio - target_ratio) < np.abs(flops_ratio - target_ratio) and e_idx > s_idx:
                 # Discard current layer
                 coarsened_indices_list.append(list(np.arange(s_idx, e_idx)))
                 s_idx = e_idx
@@ -669,7 +657,7 @@ def crius_coarsen_layers_near_uniform(layers: Sequence[JaxPipelineComputation],
         last_flops_ratio = flops_ratio
         e_idx += 1
     
-    print(f"[I] Coarsened scheme: {coarsened_indices_list}")
+    print(f"[I] Coarsened scheme in manual tuning: {coarsened_indices_list}")
     
     return coarsened_indices_list
 
@@ -708,20 +696,33 @@ def cluster_layers_and_slice_mesh(
 
     ################################
     # Modified by crius
+
     prune_search_space = os.environ.get("PRUNE_SEARCH_SPACE", "false") == "true"
+    enable_auto_tuning = os.environ.get("ENABLE_AUTO_TUNING", "false") == "true"
+    coarsened_indices_list = None
+    auto_tuning_plan_set = None
+
     if prune_search_space:
+        # Prune search space of optimal parallelism based on upper/lower bound of 
+        # each parallelizing dimension in manual tuning.
+
         # Obtain upper and lower bound of stage num
         prompt = os.environ.get("CRIUS_PRUNE_PROMPT")
         (l_p, h_p, l_d, h_d, l_m, h_m) = [int(_c) for _c in prompt.split("_")]
         num_devices = int(os.environ.get("CRIUS_GLOBAL_DEVICE_NUM"))
+        # Max/min number of stages
         max_num_stages = min(h_p, int(np.ceil(num_devices / (l_d * l_m))))
         min_num_stages = max(l_p, int(np.floor(num_devices / (h_d * h_m))))
-        print(f"[TMP] The range of stage num is: {min_num_stages} -> {max_num_stages}")
+        print(f"[TMP] The range of stage num is (min #stage -> max #stage): {min_num_stages} -> {max_num_stages}")
+        
         # Coarsen layers
-        coarsened_indices_list = crius_coarsen_layers_near_uniform(layers, max_num_stages, 
-                                                                   min_num_stages)
-    else:
-        coarsened_indices_list = None
+        coarsened_indices_list = crius_manual_tuning_coarsen_layers(layers, max_num_stages, min_num_stages)
+
+    if enable_auto_tuning:
+        # 
+
+        raise NotImplementedError()
+
     ################################
     
     inference_mode = (pipeline_schedule == "inference")
